@@ -5,6 +5,7 @@ import { AITaskGenerator, GeneratedTask } from './services/ai-task-generator';
 import { analyzeScreenshotWithAI } from './openai-service';
 import { TimeFormatter } from './services/time-formatter';
 import { generateSimpleTimeLogs } from './simple-generator';
+import { parseDocumentFile, type DocActivity } from './services/doc-parser';
 
 const TimeLogGenerator = () => {
   // State management
@@ -22,6 +23,13 @@ const TimeLogGenerator = () => {
   const [screenshots, setScreenshots] = useState<any[]>([]);
   const [analyzingScreenshot, setAnalyzingScreenshot] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  
+  // Document (.docx/.xlsx) activities and chronology toggle
+  const [docActivities, setDocActivities] = useState<DocActivity[]>([]);
+  const [docSheets, setDocSheets] = useState<string[]>([]);
+  const [sheetDates, setSheetDates] = useState<Record<string, string>>({});
+  const [useDocumentChronology, setUseDocumentChronology] = useState(false);
+  const [documentInfo, setDocumentInfo] = useState('');
   
   // Excluded days
   const [excludedDays, setExcludedDays] = useState<any[]>([]);
@@ -772,10 +780,132 @@ Include specific screens, features, or modules.`
     return cleaned.trim();
   };
   
+  // Upload and parse .docx/.xlsx document
+  const handleDocumentUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const res = await parseDocumentFile(file);
+      setDocActivities(res.activities);
+      const sheets = (res.meta?.sheets || []).filter(Boolean) as string[];
+      setDocSheets(sheets);
+      // initialize sheet dates empty
+      const datesInit: Record<string, string> = {};
+      sheets.forEach(s => { datesInit[s] = ''; });
+      setSheetDates(datesInit);
+      const days = new Set(res.activities.map(a => a.date).filter(Boolean));
+      setDocumentInfo(`${res.source.toUpperCase()} • ${res.activities.length} changes • ${days.size} days`);
+      setUseDocumentChronology(true);
+      setError('');
+    } catch (err) {
+      console.error('Document parse failed:', err);
+      setError('Failed to parse document. Please check file format (.docx/.xlsx).');
+    } finally {
+      // reset so the same file can be re-selected
+      if (event.target) (event.target as any).value = '';
+    }
+  };
+
+  // Deterministic generation from document chronology (no AI)
+  const generateFromDocumentChronology = () => {
+    if (!startDate || !endDate) {
+      setError('Please select start and end dates');
+      return;
+    }
+    if (docActivities.length === 0) {
+      setError('No document activities loaded');
+      return;
+    }
+
+    const tasks: GeneratedTask[] = [];
+    // Assign dates to activities without explicit date via sheetDates mapping
+    const effectiveActivities = docActivities.map(a => {
+      if ((!a.date || a.date === '') && a.sheet && sheetDates[a.sheet]) {
+        return { ...a, date: sheetDates[a.sheet] };
+      }
+      return a;
+    });
+    const currentDate = new Date(startDate);
+    const endDateObj = new Date(endDate);
+
+    while (currentDate <= endDateObj) {
+      const dateStr = currentDate.toISOString().split('T')[0];
+      const dayOfWeek = currentDate.getDay();
+      // Skip weekends unless specifically overridden
+      if (dayOfWeek === 0 || dayOfWeek === 6) {
+        const exception = excludedDays.find(d => d.date === dateStr);
+        if (!exception || exception.targetHours === 0) {
+          currentDate.setDate(currentDate.getDate() + 1);
+          continue;
+        }
+      }
+
+      const dayException = excludedDays.find(d => d.date === dateStr);
+      const dayTarget = dayException?.targetHours || targetHoursPerDay;
+
+      const dayActs = effectiveActivities
+        .filter(a => a.date === dateStr)
+        .sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+
+      if (dayActs.length > 0) {
+        const times = distributeWithCaps(dayTarget, dayActs.length, 2.97, 0.25);
+        dayActs.forEach((act, idx) => {
+          const descParts = [act.description];
+          if (act.status) descParts.push(`status: ${act.status}`);
+          const loc = [act.sheet, act.cell].filter(Boolean).join(' • ');
+          const meta = [loc, act.author].filter(Boolean).join(', ');
+          const taskText = [descParts.join(' '), meta ? `(${meta})` : ''].filter(Boolean).join(' ');
+          tasks.push({
+            date: dateStr,
+            time: TimeFormatter.formatForCSV(times[idx]),
+            task: taskText,
+            comments: '',
+            taskType: 'custom'
+          });
+        });
+      }
+
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+
+    setGeneratedTasks(tasks);
+    setError('');
+  };
+
+  function distributeWithCaps(total: number, count: number, maxEach: number, minEach: number): number[] {
+    const feasibleTotal = Math.max(count * minEach, Math.min(total, count * maxEach));
+    const arr = new Array(count).fill(feasibleTotal / count);
+    // clamp + redistribute
+    let changed = true;
+    while (changed) {
+      changed = false;
+      let surplus = 0;
+      for (let i = 0; i < arr.length; i++) {
+        if (arr[i] > maxEach) { surplus += (arr[i] - maxEach); arr[i] = maxEach; changed = true; }
+        if (arr[i] < minEach) { surplus -= (minEach - arr[i]); arr[i] = minEach; changed = true; }
+      }
+      if (Math.abs(surplus) < 1e-6) break;
+      const adjustable = arr.map((v, i) => i).filter(i => (surplus > 0 ? arr[i] < maxEach - 1e-6 : arr[i] > minEach + 1e-6));
+      if (adjustable.length === 0) break;
+      const delta = surplus / adjustable.length;
+      for (const i of adjustable) arr[i] += delta;
+    }
+    // round to 0.25h and scale back to feasibleTotal
+    const rounded = arr.map(h => Math.max(minEach, Math.min(maxEach, Math.round(h * 4) / 4)));
+    const sum = rounded.reduce((s, x) => s + x, 0) || 1;
+    const scale = feasibleTotal / sum;
+    return rounded.map(h => Math.max(minEach, Math.min(maxEach, Math.round(h * scale * 4) / 4)));
+  }
+  
   // Generate time logs
   const generateTimeLogs = async () => {
     if (!startDate || !endDate) {
       setError('Please select start and end dates');
+      return;
+    }
+    
+    if (useDocumentChronology && docActivities.length > 0) {
+      generateFromDocumentChronology();
       return;
     }
     
@@ -1508,6 +1638,58 @@ Include specific screens, features, or modules.`
                         <FileText className="w-4 h-4" />
                         {showWordPressCode ? 'Hide' : 'Show'} WordPress Analyzer Code
                       </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Document Upload (.docx/.xlsx) */}
+                <div className="border border-gray-200 rounded-lg overflow-hidden">
+                  <div className="bg-gray-50 px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+                    <h2 className="text-lg font-semibold flex items-center gap-2">
+                      <FileUp className="w-5 h-5 text-gray-600" />
+                      Document Data (.docx / .xlsx)
+                    </h2>
+                    <label htmlFor="doc-upload" className="px-3 py-1.5 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm cursor-pointer">
+                      Upload
+                    </label>
+                    <input id="doc-upload" type="file" accept=".docx,.xlsx" onChange={handleDocumentUpload} className="hidden" />
+                  </div>
+                  <div className="p-4 space-y-2">
+                    <div className="text-sm text-gray-600">
+                      {docActivities.length > 0 ? (
+                        <span>Loaded: {documentInfo}</span>
+                      ) : (
+                        <span>No document loaded</span>
+                      )}
+                    </div>
+                    {docSheets.length > 0 && (
+                      <div className="mt-2 space-y-2">
+                        <div className="text-xs text-gray-500">Optional: assign dates to sheets (used when activity has no date).</div>
+                        <div className="grid grid-cols-1 gap-2">
+                          {docSheets.map((s) => (
+                            <div key={s} className="flex items-center gap-2">
+                              <span className="w-40 text-sm text-gray-700 truncate">{s}</span>
+                              <input
+                                type="date"
+                                value={sheetDates[s] || ''}
+                                onChange={(e) => setSheetDates({ ...sheetDates, [s]: e.target.value })}
+                                className="px-2 py-1 border border-gray-300 rounded text-sm"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="use-doc-chronology"
+                        type="checkbox"
+                        checked={useDocumentChronology}
+                        onChange={(e) => setUseDocumentChronology(e.target.checked)}
+                      />
+                      <label htmlFor="use-doc-chronology" className="text-sm text-gray-700">
+                        Generate strictly from document chronology (ignore AI)
+                      </label>
                     </div>
                   </div>
                 </div>
